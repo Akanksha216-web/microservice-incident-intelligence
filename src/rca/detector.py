@@ -1,4 +1,5 @@
 import networkx as nx
+import numpy as np
 import pandas as pd
 
 from src.graph.builder import ServiceGraphBuilder
@@ -11,11 +12,6 @@ class RCADetector:
     """Root Cause Analysis engine combining telemetry Z-scores and dependency topology to rank fault candidates."""
 
     def __init__(self, graph: nx.DiGraph = None):
-        """Initializes the RCA engine with a service dependency graph.
-
-        Args:
-            graph (nx.DiGraph, optional): Service call dependency graph.
-        """
         self.graph = (
             graph
             if graph is not None
@@ -25,46 +21,97 @@ class RCADetector:
             f"RCADetector initialized with dependency graph containing {len(self.graph)} nodes."
         )
 
-    def rank_root_causes(
-        self, z_scores_df: pd.DataFrame, top_k: int = 5
-    ) -> list[tuple[str, float]]:
-        """Ranks microservices by maximum anomalous feature deviation.
-
-        Args:
-            z_scores_df (pd.DataFrame): DataFrame containing Z-scores for all telemetry columns.
-            top_k (int): Number of top root cause candidate services to return.
-
-        Returns:
-            list[tuple[str, float]]: Ranked list of (service_name, max_z_score) tuples.
-        """
+    def extract_service_max_zscores(
+        self, z_scores_df: pd.DataFrame
+    ) -> dict[str, float]:
         service_scores: dict[str, float] = {}
 
-        # Iterate through metric columns (excluding time)
+        # Normalize graph node names for fuzzy key lookup (e.g. removing hyphens/underscores)
+        graph_nodes = list(self.graph.nodes())
+
         for col in z_scores_df.columns:
             if col == "time":
                 continue
 
-            # Parse service name from metric string (e.g. 'checkoutservice_cpu' -> 'checkoutservice')
-            parts = col.split("_")
-            if len(parts) < 2:
-                continue
-
-            service_name = parts[0]
             max_val = float(z_scores_df[col].abs().max())
 
-            # Track maximum anomaly intensity per service
-            if (
-                service_name not in service_scores
-                or max_val > service_scores[service_name]
-            ):
-                service_scores[service_name] = max_val
+            # Match telemetry column against graph node names
+            matched_node = None
+            col_clean = col.lower().replace("-", "").replace("_", "")
 
-        # Sort services in descending order of maximum anomaly score
-        ranked_services = sorted(
-            service_scores.items(), key=lambda item: item[1], reverse=True
-        )
+            for node in graph_nodes:
+                node_clean = node.lower().replace("-", "").replace("_", "")
+                if node_clean in col_clean or col_clean.startswith(node_clean):
+                    matched_node = node
+                    break
 
-        logger.info(
-            f"Evaluated {len(service_scores)} services. Top root cause: {ranked_services[0] if ranked_services else 'None'}"
-        )
-        return ranked_services[:top_k]
+            # Fallback to prefix split if no direct graph node matched
+            if not matched_node:
+                parts = col.split("_")
+                matched_node = parts[0] if len(parts) >= 2 else col
+
+            if matched_node not in service_scores or max_val > service_scores[matched_node]:
+                service_scores[matched_node] = max_val
+
+        return service_scores
+
+    def rank_root_causes(
+        self,
+        z_scores_df: pd.DataFrame,
+        top_k: int = 5,
+        method: str = "pagerank",
+        alpha: float = 0.85,
+    ) -> list[tuple[str, float]]:
+        service_zscores = self.extract_service_max_zscores(z_scores_df)
+
+        if not service_zscores:
+            logger.warning("No valid service scores extracted from telemetry.")
+            return []
+
+        if method == "max_zscore":
+            ranked_services = sorted(
+                service_zscores.items(), key=lambda x: x[1], reverse=True
+            )
+            return ranked_services[:top_k]
+
+        elif method == "pagerank":
+            graph_nodes = set(self.graph.nodes())
+            
+            # Map personalization scores strictly over existing graph nodes
+            personalization = {}
+            total_score = 0.0
+
+            for node in graph_nodes:
+                score = service_zscores.get(node, 0.0)
+                personalization[node] = score
+                total_score += score
+
+            # Normalize personalization vector
+            if total_score > 0:
+                personalization = {k: v / total_score for k, v in personalization.items()}
+            else:
+                personalization = {k: 1.0 / len(graph_nodes) for k in graph_nodes}
+
+            try:
+                # Reverse graph edges so propagation flows back to root cause nodes
+                reversed_graph = self.graph.reverse(copy=True)
+                
+                pr_scores = nx.pagerank(
+                    reversed_graph,
+                    alpha=alpha,
+                    personalization=personalization,
+                    max_iter=500,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"PageRank computation failed ({e}), falling back to max_zscore."
+                )
+                pr_scores = service_zscores
+
+            ranked_services = sorted(
+                pr_scores.items(), key=lambda x: x[1], reverse=True
+            )
+            return ranked_services[:top_k]
+
+        else:
+            raise ValueError(f"Unsupported ranking method: {method}")
